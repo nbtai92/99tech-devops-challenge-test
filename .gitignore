@@ -1,0 +1,26 @@
+# Local files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Dependencies and logs
+node_modules/
+*.log
+
+# Terraform local state and plans
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+# Commit .terraform.lock.hcl when Terraform is introduced.
