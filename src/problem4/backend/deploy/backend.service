@@ -1,0 +1,24 @@
+[Unit]
+Description=Backend HTTP API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=backend
+Group=backend
+WorkingDirectory=/opt/backend/app
+Environment=NODE_ENV=production
+Environment=PORT=3000
+# Per-environment settings (DB URL, etc.) are provisioned on the instance, not in the bundle.
+EnvironmentFile=-/etc/backend/backend.env
+ExecStart=/usr/bin/node /opt/backend/app/src/server.js
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

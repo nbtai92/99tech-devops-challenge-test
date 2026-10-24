@@ -1,0 +1,143 @@
+# Backend: HTTP API deployed to EC2 with AWS CodeDeploy.
+#
+#   pull_request  -> CI only (lint, test, audit)
+#   push to main  -> CI -> package once -> deploy staging -> (approval) -> deploy production
+#   manual run    -> roll back to a version previously released to that environment
+#                    (run from the default branch; production still needs approval)
+name: backend
+
+on:
+  pull_request:
+    paths:
+      - "src/problem4/backend/**"
+      - ".github/workflows/backend.yml"
+      - ".github/workflows/_deploy-backend.yml"
+      - "src/problem4/ci/**"
+  push:
+    branches: [main]
+    paths:
+      - "src/problem4/backend/**"
+      - ".github/workflows/backend.yml"
+      - ".github/workflows/_deploy-backend.yml"
+      - "src/problem4/ci/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy to"
+        type: choice
+        options: [staging, production]
+        required: true
+      version:
+        description: "Full git SHA of a version previously released to that environment (rollback)"
+        type: string
+        required: true
+
+# Least privilege by default; deploy jobs opt in to OIDC.
+permissions:
+  contents: read
+
+concurrency:
+  # PRs: a new push cancels the previous CI run. Other runs get a unique group, so a
+  # run waiting for production approval never blocks the next commit's CI.
+  # Deployments are serialized per environment inside _deploy-backend.yml.
+  group: backend-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: src/problem4/backend
+
+jobs:
+  ci:
+    name: Lint, test, audit
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: src/problem4/backend/.nvmrc
+          cache: npm
+          cache-dependency-path: src/problem4/backend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  package:
+    name: Package release bundle
+    needs: ci
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: src/problem4/backend/.nvmrc
+          cache: npm
+          cache-dependency-path: src/problem4/backend/package-lock.json
+
+      - name: Install production dependencies only
+        run: npm ci --omit=dev
+
+      - name: Build CodeDeploy bundle
+        run: |
+          mkdir -p node_modules # present even when there are no runtime dependencies
+          echo "${GITHUB_SHA}" > VERSION
+          cp deploy/appspec.yml appspec.yml
+          tar -czf "${RUNNER_TEMP}/backend-${GITHUB_SHA}.tgz" \
+            appspec.yml VERSION package.json package-lock.json src deploy node_modules
+          sha256sum "${RUNNER_TEMP}/backend-${GITHUB_SHA}.tgz"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: backend-${{ github.sha }}
+          path: ${{ runner.temp }}/backend-${{ github.sha }}.tgz
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy-staging:
+    name: Deploy to staging
+    needs: package
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-backend.yml
+    with:
+      environment: staging
+      version: ${{ github.sha }}
+      mode: release
+
+  deploy-production:
+    name: Deploy to production
+    needs: deploy-staging
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-backend.yml
+    with:
+      environment: production # protected: required reviewers + main only
+      version: ${{ github.sha }}
+      mode: release
+
+  rollback:
+    name: Roll back ${{ inputs.environment }} to ${{ inputs.version }}
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-backend.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ inputs.version }}
+      mode: rollback
