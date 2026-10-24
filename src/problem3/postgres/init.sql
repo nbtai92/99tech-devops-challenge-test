@@ -1,1 +1,9 @@
-ALTER SYSTEM SET max_connections = 20;
+-- Intentionally empty.
+--
+-- The original file contained:
+--   ALTER SYSTEM SET max_connections = 20;
+-- That lowers the Postgres default (100) to 20 for no stated reason, which
+-- makes connection exhaustion much more likely as soon as the API scales
+-- out or leaks connections. Connection usage is now bounded on the client
+-- side instead (DB_POOL_MAX per API instance). This file is not mounted by
+-- docker-compose.yml.
