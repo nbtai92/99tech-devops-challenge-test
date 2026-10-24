@@ -1,0 +1,121 @@
+# Frontend: static SPA deployed to S3 behind CloudFront.
+#
+#   pull_request  -> CI only (lint, test, build)
+#   push to main  -> CI + build once -> deploy staging -> (approval) -> deploy production
+#   manual run    -> roll back to a version previously released to that environment
+#                    (run from the default branch; production still needs approval)
+name: frontend
+
+on:
+  pull_request:
+    paths:
+      - "src/problem4/frontend/**"
+      - ".github/workflows/frontend.yml"
+      - ".github/workflows/_deploy-frontend.yml"
+      - "src/problem4/ci/**"
+  push:
+    branches: [main]
+    paths:
+      - "src/problem4/frontend/**"
+      - ".github/workflows/frontend.yml"
+      - ".github/workflows/_deploy-frontend.yml"
+      - "src/problem4/ci/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy to"
+        type: choice
+        options: [staging, production]
+        required: true
+      version:
+        description: "Full git SHA of a version previously released to that environment (rollback)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: src/problem4/frontend
+
+jobs:
+  build:
+    name: Lint, test, build
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: src/problem4/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: src/problem4/frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Build
+        env:
+          APP_VERSION: ${{ github.sha }}
+        run: npm run build
+
+      - name: Package build output
+        if: github.event_name == 'push'
+        run: tar -czf "${RUNNER_TEMP}/frontend-${GITHUB_SHA}.tgz" -C dist .
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name == 'push'
+        with:
+          name: frontend-${{ github.sha }}
+          path: ${{ runner.temp }}/frontend-${{ github.sha }}.tgz
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy-staging:
+    name: Deploy to staging
+    needs: build
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-frontend.yml
+    with:
+      environment: staging
+      version: ${{ github.sha }}
+      mode: release
+
+  deploy-production:
+    name: Deploy to production
+    needs: deploy-staging
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-frontend.yml
+    with:
+      environment: production # protected: required reviewers + main only
+      version: ${{ github.sha }}
+      mode: release
+
+  rollback:
+    name: Roll back ${{ inputs.environment }} to ${{ inputs.version }}
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-frontend.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ inputs.version }}
+      mode: rollback

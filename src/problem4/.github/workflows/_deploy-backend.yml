@@ -1,0 +1,173 @@
+# Reusable: deploy one backend version (by git SHA) to one environment.
+#
+# Environment variables come from the GitHub Environment (Settings -> Environments):
+#   AWS_REGION, AWS_DEPLOY_ROLE_ARN, ARTIFACT_BUCKET,
+#   CODEDEPLOY_APP, CODEDEPLOY_GROUP, BACKEND_URL, FRONTEND_URL
+name: deploy-backend
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      version:
+        description: "Git SHA of the release"
+        type: string
+        required: true
+      mode:
+        description: >-
+          release: publish the bundle built in this run; skip if a newer version is already deployed.
+          rollback: deploy a bundle already in this environment's artifact bucket, even if it is older.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: CodeDeploy (${{ inputs.environment }}, ${{ inputs.mode }})
+    runs-on: ubuntu-24.04
+    # Budget: wait for a previous deployment (15m) + deployment (30m)
+    # + stop on timeout (5m) + automatic rollback (15m) + setup/smoke.
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      id-token: write # OIDC: no long-lived AWS keys in GitHub
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.BACKEND_URL }}
+    # One deployment per environment at a time, never cancelled mid-flight.
+    # A newer pending run replaces an older *pending* one (latest candidate wins);
+    # the release guard below handles runs that finish out of order.
+    concurrency:
+      group: backend-deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ inputs.version }}
+      MODE: ${{ inputs.mode }}
+      BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      KEY: backend/${{ inputs.version }}.tgz
+      APP: ${{ vars.CODEDEPLOY_APP }}
+      GROUP: ${{ vars.CODEDEPLOY_GROUP }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::version must be a full 40-char git SHA"; exit 1; }
+          [[ "$MODE" == release || "$MODE" == rollback ]] || { echo "::error::mode must be release or rollback"; exit 1; }
+
+      # Full history for the release guard; also provides the ci/ scripts.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download bundle from this run
+        if: inputs.mode == 'release'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: backend-${{ inputs.version }}
+          path: bundle
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-backend-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Wait until no other deployment is active
+        run: src/problem4/ci/codedeploy-wait.sh idle "$APP" "$GROUP" 900
+
+      - name: Release guard (never replace a newer version)
+        id: guard
+        run: |
+          if [ "$MODE" = rollback ]; then
+            echo "decision=deploy" >> "$GITHUB_OUTPUT"; echo "rollback: guard bypassed"; exit 0
+          fi
+          last=$(aws deploy get-deployment-group --application-name "$APP" --deployment-group-name "$GROUP" \
+            --query deploymentGroupInfo.lastSuccessfulDeployment.deploymentId --output text)
+          current=""
+          if [ -n "$last" ] && [ "$last" != None ]; then
+            key=$(aws deploy get-deployment --deployment-id "$last" \
+              --query deploymentInfo.revision.s3Location.key --output text)
+            current=$(basename "$key" .tgz)
+          fi
+          echo "currently deployed: ${current:-none}"
+          echo "decision=$(src/problem4/ci/release-guard.sh "$VERSION" "$current")" >> "$GITHUB_OUTPUT"
+
+      - name: Skipped (newer version already deployed)
+        if: steps.guard.outputs.decision == 'skip'
+        run: |
+          echo "::notice::Skipped ${VERSION}: a newer version is already deployed to ${{ inputs.environment }}."
+
+      - name: Publish bundle to S3 (immutable, one object per SHA)
+        if: inputs.mode == 'release' && steps.guard.outputs.decision == 'deploy'
+        run: |
+          if aws s3api head-object --bucket "$BUCKET" --key "$KEY" >/dev/null 2>&1; then
+            echo "s3://$BUCKET/$KEY already exists, not overwriting"
+          else
+            aws s3 cp "bundle/backend-${VERSION}.tgz" "s3://$BUCKET/$KEY" --only-show-errors
+          fi
+
+      - name: Check bundle exists in this environment
+        if: steps.guard.outputs.decision == 'deploy'
+        run: |
+          aws s3api head-object --bucket "$BUCKET" --key "$KEY" >/dev/null || {
+            echo "::error::s3://$BUCKET/$KEY not found. Only versions previously released to ${{ inputs.environment }} can be rolled back to."
+            exit 1; }
+
+      - name: Create CodeDeploy deployment
+        id: deploy
+        if: steps.guard.outputs.decision == 'deploy'
+        run: |
+          # The deployment group is configured for rolling, health-checked updates
+          # behind the ALB (e.g. OneAtATime). Auto-rollback restores the previous revision
+          # if a lifecycle hook (incl. ValidateService) fails or a CloudWatch alarm fires.
+          id=$(aws deploy create-deployment \
+            --application-name "$APP" \
+            --deployment-group-name "$GROUP" \
+            --s3-location "bucket=$BUCKET,key=$KEY,bundleType=tgz" \
+            --description "backend ${VERSION} (${MODE}) by ${GITHUB_ACTOR}, run ${GITHUB_RUN_ID}" \
+            --auto-rollback-configuration "enabled=true,events=DEPLOYMENT_FAILURE,DEPLOYMENT_STOP_ON_ALARM" \
+            --query deploymentId --output text)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "CodeDeploy deployment: $id"
+
+      # Polls the real status. On failure or timeout it does not return until AWS has
+      # finished (stopped deployment + automatic rollback), so the concurrency lock is
+      # held for as long as AWS is deploying.
+      - name: Wait for deployment (and any automatic rollback)
+        if: steps.guard.outputs.decision == 'deploy'
+        run: src/problem4/ci/codedeploy-wait.sh deployment "${{ steps.deploy.outputs.id }}" 1800
+
+      - name: Smoke test through the load balancer
+        if: steps.guard.outputs.decision == 'deploy'
+        env:
+          URL: ${{ vars.BACKEND_URL }}
+        run: |
+          for i in $(seq 1 10); do
+            got=$(curl -fsS --max-time 5 "$URL/health" | jq -r .version) || got=""
+            if [ "$got" = "$VERSION" ]; then echo "OK: $URL serves $VERSION"; exit 0; fi
+            echo "attempt $i: got '${got}', want '${VERSION}'"; sleep 6
+          done
+          # CodeDeploy already reported success, so nothing rolls back automatically here.
+          echo "::error::$URL is not serving ${VERSION}. Roll back manually: run the 'backend' workflow with mode rollback."
+          exit 1
+
+      - name: Integration check (frontend origin can call the API)
+        if: steps.guard.outputs.decision == 'deploy'
+        run: src/problem4/ci/check-cors.sh "${{ vars.BACKEND_URL }}" "${{ vars.FRONTEND_URL }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Backend → ${{ inputs.environment }} (${MODE})"
+            echo "- Version: \`${VERSION}\`"
+            echo "- Decision: ${{ steps.guard.outputs.decision || 'n/a' }}"
+            echo "- Bundle: \`s3://${BUCKET}/${KEY}\`"
+            echo "- CodeDeploy: \`${{ steps.deploy.outputs.id || 'none' }}\`"
+            echo "- Result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"

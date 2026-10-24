@@ -9,7 +9,7 @@ Solutions to the [99Tech DevOps Challenge](https://github.com/99techteam/devops-
 | 1 | Building Castle In The Cloud | [Solution](src/problem1/SOLUTION.md) | Completed |
 | 2 | Diagnose Me Doctor | [Solution](src/problem2/SOLUTION.md) | Completed |
 | 3 | Debugging issues within system | [Starter instructions](src/problem3/README.md) | Completed |
-| 4 | Ship It Twice | [Solution](src/problem4/SOLUTION.md) | Not started |
+| 4 | Ship It Twice | [Solution](src/problem4/SOLUTION.md) | Completed |
 | 5 | Fortify The Castle | [Solution](src/problem5/SOLUTION.md) | Not started |
 
 ## Repository structure

@@ -1,0 +1,35 @@
+# AWS CodeDeploy (EC2/on-premises) application specification.
+# Packaged at the root of the release bundle by the backend workflow.
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /opt/backend/app
+file_exists_behavior: OVERWRITE
+permissions:
+  - object: /opt/backend/app
+    owner: backend
+    group: backend
+hooks:
+  # Runs the stop script of the *previous* revision.
+  ApplicationStop:
+    - location: deploy/scripts/application_stop.sh
+      timeout: 60
+      runas: root
+  BeforeInstall:
+    - location: deploy/scripts/before_install.sh
+      timeout: 60
+      runas: root
+  AfterInstall:
+    - location: deploy/scripts/after_install.sh
+      timeout: 60
+      runas: root
+  ApplicationStart:
+    - location: deploy/scripts/application_start.sh
+      timeout: 60
+      runas: root
+  # A failing health check fails the deployment, and CodeDeploy rolls back.
+  ValidateService:
+    - location: deploy/scripts/validate_service.sh
+      timeout: 120
+      runas: root

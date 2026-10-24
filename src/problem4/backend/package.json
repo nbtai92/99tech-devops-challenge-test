@@ -1,0 +1,15 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal HTTP API used to demonstrate the CI/CD pipeline.",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "lint": "for f in src/*.js test/*.js; do node --check \"$f\" || exit 1; done",
+    "test": "node --test"
+  }
+}
